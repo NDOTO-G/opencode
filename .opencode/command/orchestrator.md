@@ -59,7 +59,7 @@ Dispatch one or more Sonnet sub-agents to scan the codebase. Organize scouts by 
 Launch scouts using the Task tool:
   - `subagent_type`: `"general-purpose"`
   - `model`: `"sonnet"`
-  - `run_in_background`: `true` (launch all scouts in parallel)
+  - Launch all scouts as **multiple Task calls in a single message** — they execute concurrently and all results return before you continue.
 
 **Scout Prompt Template:**
 
@@ -82,7 +82,7 @@ For each file, provide:
 Return a structured report. Be thorough but concise — summarize, don't paste entire files. Your report will be used by an orchestrator to plan execution order, so focus on information that reveals dependencies and patterns.
 ```
 
-Wait for all scouts to return before proceeding.
+Since all scouts were launched in the same message, their results all return together. Proceed once you have all reports.
 
 #### 2b. Synthesize Scout Reports and Map File Overlaps
 
@@ -130,6 +130,21 @@ Format your strategy as:
 - P1 ∥ P3: No shared files. P1 works in src/models/, P3 works in src/utils/. Independent concerns.
 - P5 last: Modifies src/routes/index.ts which imports from all prior packets.
 ```
+
+#### Parallelism Safety Checklist
+
+Before placing two packets in the same parallel group, ALL of the following conditions must be TRUE:
+
+1. **No shared files**: Neither packet creates nor modifies the same file.
+2. **No import dependency**: Neither packet imports from files the other creates or modifies.
+3. **No pattern-setting relationship**: Neither packet establishes a new convention (file structure, naming, error handling, API shape) that the other should follow. The first packet to introduce a pattern is a "pattern-setter" and must complete before followers start.
+4. **No declared dependency**: The plan does not declare a dependency between them.
+5. **No shared test infrastructure**: Neither packet creates test utilities, fixtures, or helpers the other needs.
+6. **No shared config/wiring**: Neither packet modifies shared configuration, routing, registry, or barrel-export files that the other also touches.
+
+If ANY condition is FALSE → the packets MUST be in different groups and run sequentially. No exceptions, no "probably fine."
+
+When justifying parallel placement in the execution strategy, cite which checklist items you verified and how. Example: *"P1 ∥ P3: Checklist passes — P1 touches only `src/models/user.ts`, P3 touches only `src/utils/hash.ts`, no imports between them, no shared config files, neither sets patterns for the other."*
 
 **Be conservative.** When in doubt, make it sequential. Parallel execution saves time but a bad parallel decision causes merge conflicts or inconsistent patterns. It is always safer to serialize than to guess.
 
@@ -209,11 +224,41 @@ Format your strategy as:
 
 Execute packets **group by group** following the Execution Strategy from Step 2.
 
-- **Within a group**: Launch all packets in parallel using multiple Task calls in a single message with `run_in_background: true`.
 - **Between groups**: Wait for ALL packets in the current group to reach DONE (or BLOCKED/PARTIAL after retries) before starting the next group.
-- **Single-packet groups**: Run normally (no parallelism needed).
+- **Single-packet groups**: Run the builder directly in the main working directory. No worktree needed.
+- **Multi-packet parallel groups**: Use **git worktrees** to isolate each builder (see Step 4.0).
 
-For EACH packet within a group, follow Steps 4a through 4e:
+For EACH execution group, follow this sequence:
+
+#### 4.0. Group Setup: Worktree Isolation (parallel groups only)
+
+**Skip this step for single-packet groups.** Only set up worktrees when a group has 2+ packets running in parallel.
+
+Before dispatching any builders in a parallel group, create an isolated git worktree for each packet:
+
+```bash
+# For each packet P{N} in the parallel group:
+git worktree add .worktrees/P{N} -b packet/P{N}
+```
+
+This creates:
+- A separate, full checkout of the project at `.worktrees/P{N}/` for each packet
+- A dedicated branch `packet/P{N}` based on current HEAD
+- Complete git isolation — each builder can modify files, stage, commit, and run tests without interfering with other builders
+
+**Why worktrees?** Without isolation, parallel builders race on `git add`, `git commit`, and see each other's unstaged changes. Worktrees eliminate this entire class of problems.
+
+After setting up worktrees, proceed to Steps 4a through 4e for each packet. The key flow for parallel groups:
+
+1. **Diff review first (4a)** — For Group 2+, review what prior groups built. This is done once for the group since all packets share the same dependencies.
+2. **Compose ALL builder prompts (4b)** — Build prompts for every packet in the group, incorporating the diff review.
+3. **Dispatch ALL builders as multiple Task calls in a single message** — They execute concurrently in their isolated worktrees. All results return together.
+4. **Capture SHAs** — After all builders return, capture each packet's SHA from its worktree.
+5. **Dispatch ALL validators as multiple Task calls in a single message** — They execute concurrently, each inspecting its packet's worktree.
+6. **Make decisions (4d)** and **update state (4e)** for each packet based on validator reports.
+7. **Merge and clean up (4f)** — Merge validated worktree branches, clean up all worktrees.
+
+For EACH packet within the group:
 
 #### 4a. Dependency Diff Review (for packets in Group 2+)
 
@@ -255,6 +300,10 @@ You are implementing Packet {ID} of an implementation plan.
 
 ## Plan Context
 {1-3 sentence summary of the overall plan objective, pulled from the plan's top-level description/objective section}
+
+## Working Directory
+{If this packet is in a parallel group: "Your working directory is `.worktrees/P{N}/`. ALL file operations, commands, and git commits must be run from this directory. Do NOT operate in the repository root — other builders are working there concurrently."}
+{If this packet is in a single-packet group: "Work in the repository root directory."}
 
 ## Files to Work On
 {list each file path with a brief note on what to do with it}
@@ -313,7 +362,10 @@ You MUST end your response with this structured report:
 Use DONE if all criteria are met. Use PARTIAL if some criteria are met but others are not. Use BLOCKED if you cannot proceed due to a missing prerequisite outside your control.
 ```
 
-- When the builder returns, **capture the SHA**: run `git rev-parse HEAD` and store it as this packet's `SHA After Build` in the task board.
+- When the builder returns, **capture the SHA**:
+  - **Parallel group (worktree)**: run `git -C .worktrees/P{N} rev-parse HEAD` to get the SHA from the builder's worktree branch.
+  - **Single-packet group**: run `git rev-parse HEAD`.
+  - Store the SHA as this packet's `SHA After Build` in the task board.
 - Mark the build task as `completed` in TodoWrite.
 
 #### 4c. Dispatch Validator Sub-Agent
@@ -341,6 +393,10 @@ Each of these MUST be satisfied. Check every one:
 1. [criterion 1]
 2. [criterion 2]
 3. [criterion 3]
+
+## Working Directory
+{If this packet is in a parallel group: "The builder worked in `.worktrees/P{N}/`. Inspect files and run all verification commands from this directory."}
+{If this packet is in a single-packet group: "Inspect files and run commands from the repository root directory."}
 
 ## Files That Should Have Been Created or Modified
 {list of files from the packet}
@@ -415,7 +471,36 @@ After the validator returns, YOU (the orchestrator) make the final call. Read th
 
 - Update the task board file with all reports and the final status.
 - Ensure TodoWrite reflects the current state.
-- If this was the last packet in the current group, proceed to the next group (back to Step 4a for the first packet in that group).
+
+#### 4f. Group Completion: Merge and Clean Up (parallel groups only)
+
+**Skip this step for single-packet groups.** Only perform merge/cleanup when the group used worktrees.
+
+After ALL packets in a parallel group have reached their final status (DONE, PARTIAL, or BLOCKED after retries):
+
+1. **Merge validated work.** For each packet that reached DONE status, merge its worktree branch into the main branch:
+   ```bash
+   git merge packet/P{N} --no-edit
+   ```
+   Merge in the order packets appear in the group. If a merge conflict occurs:
+   - This indicates the parallelism analysis had a gap — the packets had a hidden file overlap or implicit dependency.
+   - Record the conflict in the task board.
+   - Attempt to resolve if the conflict is simple and obvious (e.g., both packets added different entries to a list or registry).
+   - If the conflict is complex, abort the merge (`git merge --abort`), mark the conflicting packet as PARTIAL with a note, and plan to re-execute it sequentially in a later group after the other packet's changes are merged.
+
+2. **Skip failed work.** Packets with status PARTIAL or BLOCKED are NOT merged. Their worktree branches are discarded.
+
+3. **Clean up ALL worktrees** in the group, regardless of packet status:
+   ```bash
+   git worktree remove .worktrees/P{N} --force
+   git branch -D packet/P{N}
+   ```
+
+4. **Capture group SHA.** Run `git rev-parse HEAD` to record the SHA after all merges complete. This becomes the base for the next group's worktrees and diff reviews.
+
+5. **Verify merged state.** Run a quick sanity check (build, compile, or lint) on the merged result to ensure the combined changes are consistent. If the check fails, investigate which merge introduced the issue and record it in the task board.
+
+After group completion, proceed to the next group (back to Step 4.0 for the next group's setup).
 
 ### Step 5: Final Report
 
@@ -466,13 +551,14 @@ Updated task board saved to: `specs/packet-runs/<filename>-run.md`
 1. **You are the orchestrator.** You do NOT write code. You do NOT validate code. All implementation is done by builder sub-agents. All validation is done by validator sub-agents. Your job is to read, reason, compose prompts, and make decisions.
 2. **Execute by group.** Follow the execution strategy from Step 2. Packets within a group run in parallel. Groups run sequentially. Never start a group before the prior group is fully resolved.
 3. **Always analyze before strategizing.** The execution strategy must be based on actual codebase analysis (file overlaps, implicit dependencies, pattern-setters), not just declared dependencies. Dispatch scouts to read the relevant files, then use their reports to decide.
-4. **Be conservative with parallelism.** When in doubt about whether two packets can safely run in parallel, make them sequential. A wrong parallel decision causes merge conflicts or inconsistent patterns. It is always safer to serialize than to guess.
-5. **Always diff-review before dependent packets.** When a new group starts, review the actual diff and reports from the prior group BEFORE composing any builder prompts. This is non-negotiable — it is the mechanism that keeps downstream packets aligned with what was actually built upstream.
-6. **Validators are independent.** The validator sub-agent does NOT see the builder's self-report. It receives only the packet criteria, expected files, and verification commands. Its job is to independently confirm the work.
-7. **Resume builders, fresh validators.** When a builder needs to retry, resume it (preserving context). When re-validating, launch a fresh validator (unbiased by prior validation).
-8. **Track everything.** Use TodoWrite for live progress AND the persistent task board file for durable records. Record builder reports, validator reports, diff review notes, and execution strategy reasoning.
-9. **Respect scope.** Do not add features, refactor code, or do work beyond what the plan specifies.
-10. **Provide the plan context.** Every builder prompt must include the overall plan objective so the agent understands WHY it is building what it is building.
-11. **Adapt between packets.** The builder prompt template is a starting point. Your primary value is in the `## What Was Built Before You` section and any adjustments you make based on the diff review. Enrich, clarify, and correct the prompt based on what you observe in the evolving codebase.
-12. **Handle blockers gracefully.** A BLOCKED packet is not a failure — it's information. Record it, assess if you can unblock it, and keep the rest of the plan moving.
-13. **Guard your context window.** Your context is for reasoning, not for storing raw source code. Delegate file reading to scout and builder sub-agents. When you need to review work (diff review, validation decisions), read reports and diffs — not entire source files. The moment you start reading large files yourself, you're doing a sub-agent's job.
+4. **Be conservative with parallelism.** Apply the Parallelism Safety Checklist from Step 2d rigorously. All six conditions must be TRUE before placing packets in the same parallel group. When in doubt, serialize. A wrong parallel decision causes merge conflicts or inconsistent patterns.
+5. **Use worktrees for parallel isolation.** When a group has 2+ packets, always create git worktrees so each builder gets an isolated checkout. Never run parallel builders in the same working directory. Merge worktree branches after validation; clean up worktrees after merging.
+6. **Always diff-review before dependent packets.** When a new group starts, review the actual diff and reports from the prior group BEFORE composing any builder prompts. This is non-negotiable — it is the mechanism that keeps downstream packets aligned with what was actually built upstream.
+7. **Validators are independent.** The validator sub-agent does NOT see the builder's self-report. It receives only the packet criteria, expected files, and verification commands. Its job is to independently confirm the work.
+8. **Resume builders, fresh validators.** When a builder needs to retry, resume it (preserving context). When re-validating, launch a fresh validator (unbiased by prior validation).
+9. **Track everything.** Use TodoWrite for live progress AND the persistent task board file for durable records. Record builder reports, validator reports, diff review notes, and execution strategy reasoning.
+10. **Respect scope.** Do not add features, refactor code, or do work beyond what the plan specifies.
+11. **Provide the plan context.** Every builder prompt must include the overall plan objective so the agent understands WHY it is building what it is building.
+12. **Adapt between packets.** The builder prompt template is a starting point. Your primary value is in the `## What Was Built Before You` section and any adjustments you make based on the diff review. Enrich, clarify, and correct the prompt based on what you observe in the evolving codebase.
+13. **Handle blockers gracefully.** A BLOCKED packet is not a failure — it's information. Record it, assess if you can unblock it, and keep the rest of the plan moving.
+14. **Guard your context window.** Your context is for reasoning, not for storing raw source code. Delegate file reading to scout and builder sub-agents. When you need to review work (diff review, validation decisions), read reports and diffs — not entire source files. The moment you start reading large files yourself, you're doing a sub-agent's job.
